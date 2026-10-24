@@ -6,7 +6,6 @@
 #include <FreeRTOS.h>
 #include <os_task.h>
 #include <os_queue.h>
-
 #include <string.h>
 
 #define THERMAL_MGR_STACK_SIZE 256U
@@ -42,19 +41,73 @@ void initThermalSystemManager(lm75bd_config_t *config) {
 }
 
 error_code_t thermalMgrSendEvent(thermal_mgr_event_t *event) {
-  /* Send an event to the thermal manager queue */
+
+  if (event == NULL || thermalMgrQueueHandle == NULL) {
+    return ERR_CODE_INVALID_ARG;
+  }
+
+  if (xQueueSend(thermalMgrQueueHandle, (void *) event, portMAX_DELAY) != pdPASS) {
+    return ERR_CODE_QUEUE_FULL;
+  }
 
   return ERR_CODE_SUCCESS;
 }
 
 void osHandlerLM75BD(void) {
-  /* Implement this function */
+  if (thermalMgrQueueHandle == NULL) {
+    return;
+  }
+
+  // have an interupt signal, send to front of queue (from ISR for saftey)
+  thermal_mgr_event_t event = { .type = THERMAL_MGR_EVENT_OS_INTERRUPT};
+  BaseType_t higherPriority = pdFALSE;
+
+  xQueueSendToFrontFromISR(thermalMgrQueueHandle, &event, &higherPriority);
+  // portYILED_FROM_ISR, forces this os interputt to run before next tick since highest priority
+  portYIELD_FROM_ISR(higherPriority);
 }
 
 static void thermalMgr(void *pvParameters) {
-  /* Implement this task */
+
+  if (pvParameters == NULL) {
+    // must use vTaskDelete at end of task fucntion not just return (forcing job to be finsihed must delete itself)
+    vTaskDelete(NULL);
+  }
+  
+  lm75bd_config_t data =  *(lm75bd_config_t *) pvParameters;
+  thermal_mgr_event_t recv_buff;
+
   while (1) {
-    
+    if ((xQueueReceive(thermalMgrQueueHandle, &recv_buff, portMAX_DELAY) == pdPASS)) {
+      float temp;
+
+      error_code_t err = readTempLM75BD(data.devAddr, &temp);
+
+      if (err != ERR_CODE_SUCCESS) {
+        printConsole("Failed to read temp from LM75BD : error code %d\n", (int) err);
+        if (recv_buff.type == THERMAL_MGR_EVENT_OS_INTERRUPT) {
+          overTemperatureDetected();
+        }
+        continue; // dont want to use the garbage in temp
+      }
+
+      switch (recv_buff.type) {
+        case THERMAL_MGR_EVENT_MEASURE_TEMP_CMD:
+          addTemperatureTelemetry(temp);
+          break;
+
+        case THERMAL_MGR_EVENT_OS_INTERRUPT:
+          if (temp > LM75BD_DEFAULT_HYST_THRESH) {
+            overTemperatureDetected();
+          } else {
+            safeOperatingConditions();
+          }
+          break;
+        
+        default:
+          break;
+      }
+    }
   }
 }
 
